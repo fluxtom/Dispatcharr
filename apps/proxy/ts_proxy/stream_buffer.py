@@ -23,7 +23,8 @@ logger = get_logger()
 # increments of ~3600 (90kHz clock); normal AAC audio has ~1920.
 # Increments < DTS_DEDUP_THRESHOLD are unmistakably duplicate.
 
-DTS_DEDUP_THRESHOLD = 100  # ticks at 90kHz — anything below this is a dupe
+DTS_DEDUP_THRESHOLD = 100   # ticks at 90kHz — anything below this is a dupe
+DTS_RESUME_REQUIRED = 5     # consecutive normal-increment PES packets needed to exit drop mode
 TS_SYNC_BYTE = 0x47
 
 
@@ -34,14 +35,24 @@ class TSDeduplicator:
     source re-sends 2-3 seconds of data.  FFmpeg's mpegts muxer detects
     the backwards DTS and increments by 1 for each duplicate packet.
     This class detects that anomalous pattern and drops those packets.
+
+    Drop mode is GLOBAL across all content PIDs — when any PID shows
+    the DTS+1 pattern, ALL content PIDs are dropped until the burst
+    ends.  This prevents interleaved audio/video from toggling the
+    filter and leaking garbled audio.
+
+    Hysteresis: exiting drop mode requires DTS_RESUME_REQUIRED
+    consecutive normal-increment PES packets across any PID.
     """
 
     def __init__(self, channel_id=None):
         self.channel_id = channel_id
-        self.highest_dts = {}    # pid -> highest DTS seen
-        self.dropping = {}       # pid -> True while in DTS+1 drop mode
+        self.highest_dts = {}       # pid -> highest DTS seen
+        self.global_dropping = False # single flag for all content PIDs
+        self.resume_count = 0       # consecutive normal increments seen
         self.total_dropped = 0
         self.total_passed = 0
+        self._drop_logged = False   # prevent log spam
 
     def filter_packets(self, data):
         """Filter a bytearray of TS-aligned packets, returning clean data.
@@ -57,15 +68,12 @@ class TSDeduplicator:
 
         output = bytearray()
         offset = 0
-        entered_drop = False
-        exited_drop = False
 
         while offset + TS_PACKET_SIZE <= len(data):
             packet = data[offset:offset + TS_PACKET_SIZE]
             offset += TS_PACKET_SIZE
 
             if packet[0] != TS_SYNC_BYTE:
-                # Shouldn't happen with aligned data, but pass through
                 output.extend(packet)
                 self.total_passed += 1
                 continue
@@ -78,13 +86,15 @@ class TSDeduplicator:
                 self.total_passed += 1
                 continue
 
-            pusi = (packet[1] >> 6) & 0x01  # Payload Unit Start Indicator
+            # If globally dropping, drop ALL content packets unless
+            # this is a PES start we can check for resume
+            pusi = (packet[1] >> 6) & 0x01
             adaptation = (packet[3] >> 4) & 0x03
             has_payload = adaptation in (1, 3)
 
-            # Continuation packets follow their PID's drop state
             if not pusi or not has_payload:
-                if self.dropping.get(pid, False):
+                # Continuation packet — follows global drop state
+                if self.global_dropping:
                     self.total_dropped += 1
                     continue
                 output.extend(packet)
@@ -99,8 +109,7 @@ class TSDeduplicator:
             dts = self._extract_dts(packet, payload_offset)
 
             if dts is None:
-                # No DTS extractable — follow current drop state
-                if self.dropping.get(pid, False):
+                if self.global_dropping:
                     self.total_dropped += 1
                     continue
                 output.extend(packet)
@@ -108,9 +117,10 @@ class TSDeduplicator:
                 continue
 
             if pid not in self.highest_dts:
-                # First packet for this PID
                 self.highest_dts[pid] = dts
-                self.dropping[pid] = False
+                if self.global_dropping:
+                    self.total_dropped += 1
+                    continue
                 output.extend(packet)
                 self.total_passed += 1
                 continue
@@ -121,43 +131,44 @@ class TSDeduplicator:
             if increment < -(1 << 32):
                 increment += (1 << 33)
 
-            if 0 < increment < DTS_DEDUP_THRESHOLD:
-                # DTS+1 pattern detected — this is duplicate data
-                if not self.dropping.get(pid, False):
-                    entered_drop = True
-                self.dropping[pid] = True
-                self.total_dropped += 1
-                continue
-
-            if increment >= DTS_DEDUP_THRESHOLD:
-                # Normal increment — resume passing
-                if self.dropping.get(pid, False):
-                    exited_drop = True
-                self.dropping[pid] = False
+            if 0 < increment < DTS_DEDUP_THRESHOLD or increment <= 0:
+                # DTS+1 or backwards — duplicate data
+                if not self.global_dropping:
+                    self.global_dropping = True
+                    self.resume_count = 0
+                    self._drop_logged = False
+                    logger.warning(
+                        f"[ts_dedup] Channel {self.channel_id}: "
+                        f"duplicate burst detected — dropping all content packets"
+                    )
+                # Still update highest_dts so we track where the dupes end
                 self.highest_dts[pid] = dts
-                output.extend(packet)
-                self.total_passed += 1
-                continue
-
-            if increment <= 0:
-                # Backwards or zero — also drop
-                if not self.dropping.get(pid, False):
-                    entered_drop = True
-                self.dropping[pid] = True
                 self.total_dropped += 1
                 continue
 
-        if entered_drop:
-            logger.info(
-                f"[ts_dedup] Channel {self.channel_id}: "
-                f"DTS+1 duplicate detected — dropping packets"
-            )
-        if exited_drop:
-            logger.info(
-                f"[ts_dedup] Channel {self.channel_id}: "
-                f"DTS resumed normal increments — passing "
-                f"(total dropped: {self.total_dropped})"
-            )
+            # Normal increment (>= threshold)
+            self.highest_dts[pid] = dts
+
+            if self.global_dropping:
+                self.resume_count += 1
+                if self.resume_count >= DTS_RESUME_REQUIRED:
+                    # Enough consecutive normal packets — safe to resume
+                    self.global_dropping = False
+                    logger.warning(
+                        f"[ts_dedup] Channel {self.channel_id}: "
+                        f"duplicate burst ended — resuming "
+                        f"(dropped {self.total_dropped} packets total)"
+                    )
+                    output.extend(packet)
+                    self.total_passed += 1
+                    continue
+                else:
+                    # Not enough normal packets yet — keep dropping
+                    self.total_dropped += 1
+                    continue
+
+            output.extend(packet)
+            self.total_passed += 1
 
         return output
 
