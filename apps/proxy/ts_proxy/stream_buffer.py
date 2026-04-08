@@ -16,6 +16,185 @@ import gevent  # Make sure this import is at the top
 
 logger = get_logger()
 
+# ── MPEG-TS DTS Deduplication ───────────────────────────────────────
+# When FFmpeg is run with -copyts, its mpegts muxer cannot write
+# backwards DTS values.  Instead it increments DTS by 1 tick for each
+# duplicate packet (the "DTS+1 hack").  Normal video at 25fps has DTS
+# increments of ~3600 (90kHz clock); normal AAC audio has ~1920.
+# Increments < DTS_DEDUP_THRESHOLD are unmistakably duplicate.
+
+DTS_DEDUP_THRESHOLD = 100  # ticks at 90kHz — anything below this is a dupe
+TS_SYNC_BYTE = 0x47
+
+
+class TSDeduplicator:
+    """Detects and strips duplicate TS packets caused by FFmpeg's DTS+1 hack.
+
+    When the IPTV source drops and FFmpeg reconnects with -copyts, the
+    source re-sends 2-3 seconds of data.  FFmpeg's mpegts muxer detects
+    the backwards DTS and increments by 1 for each duplicate packet.
+    This class detects that anomalous pattern and drops those packets.
+    """
+
+    def __init__(self, channel_id=None):
+        self.channel_id = channel_id
+        self.highest_dts = {}    # pid -> highest DTS seen
+        self.dropping = {}       # pid -> True while in DTS+1 drop mode
+        self.total_dropped = 0
+        self.total_passed = 0
+
+    def filter_packets(self, data):
+        """Filter a bytearray of TS-aligned packets, returning clean data.
+
+        Args:
+            data: bytearray of complete, TS-aligned 188-byte packets
+
+        Returns:
+            bytearray with duplicate packets removed
+        """
+        if not data:
+            return data
+
+        output = bytearray()
+        offset = 0
+        entered_drop = False
+        exited_drop = False
+
+        while offset + TS_PACKET_SIZE <= len(data):
+            packet = data[offset:offset + TS_PACKET_SIZE]
+            offset += TS_PACKET_SIZE
+
+            if packet[0] != TS_SYNC_BYTE:
+                # Shouldn't happen with aligned data, but pass through
+                output.extend(packet)
+                self.total_passed += 1
+                continue
+
+            pid = ((packet[1] & 0x1F) << 8) | packet[2]
+
+            # Always pass system PIDs (PAT, PMT, CAT, etc.) and null packets
+            if pid <= 0x1F or pid == 0x1FFF:
+                output.extend(packet)
+                self.total_passed += 1
+                continue
+
+            pusi = (packet[1] >> 6) & 0x01  # Payload Unit Start Indicator
+            adaptation = (packet[3] >> 4) & 0x03
+            has_payload = adaptation in (1, 3)
+
+            # Continuation packets follow their PID's drop state
+            if not pusi or not has_payload:
+                if self.dropping.get(pid, False):
+                    self.total_dropped += 1
+                    continue
+                output.extend(packet)
+                self.total_passed += 1
+                continue
+
+            # PES start packet — extract DTS
+            payload_offset = 4
+            if adaptation in (2, 3):
+                payload_offset = 5 + packet[4]
+
+            dts = self._extract_dts(packet, payload_offset)
+
+            if dts is None:
+                # No DTS extractable — follow current drop state
+                if self.dropping.get(pid, False):
+                    self.total_dropped += 1
+                    continue
+                output.extend(packet)
+                self.total_passed += 1
+                continue
+
+            if pid not in self.highest_dts:
+                # First packet for this PID
+                self.highest_dts[pid] = dts
+                self.dropping[pid] = False
+                output.extend(packet)
+                self.total_passed += 1
+                continue
+
+            increment = dts - self.highest_dts[pid]
+
+            # Handle 33-bit DTS wraparound (~26.5 hours)
+            if increment < -(1 << 32):
+                increment += (1 << 33)
+
+            if 0 < increment < DTS_DEDUP_THRESHOLD:
+                # DTS+1 pattern detected — this is duplicate data
+                if not self.dropping.get(pid, False):
+                    entered_drop = True
+                self.dropping[pid] = True
+                self.total_dropped += 1
+                continue
+
+            if increment >= DTS_DEDUP_THRESHOLD:
+                # Normal increment — resume passing
+                if self.dropping.get(pid, False):
+                    exited_drop = True
+                self.dropping[pid] = False
+                self.highest_dts[pid] = dts
+                output.extend(packet)
+                self.total_passed += 1
+                continue
+
+            if increment <= 0:
+                # Backwards or zero — also drop
+                if not self.dropping.get(pid, False):
+                    entered_drop = True
+                self.dropping[pid] = True
+                self.total_dropped += 1
+                continue
+
+        if entered_drop:
+            logger.info(
+                f"[ts_dedup] Channel {self.channel_id}: "
+                f"DTS+1 duplicate detected — dropping packets"
+            )
+        if exited_drop:
+            logger.info(
+                f"[ts_dedup] Channel {self.channel_id}: "
+                f"DTS resumed normal increments — passing "
+                f"(total dropped: {self.total_dropped})"
+            )
+
+        return output
+
+    @staticmethod
+    def _extract_dts(packet, payload_offset):
+        """Extract DTS (or PTS if no DTS) from a PES header."""
+        if payload_offset >= TS_PACKET_SIZE - 14:
+            return None
+
+        p = packet[payload_offset:]
+        if len(p) < 14 or p[0] != 0 or p[1] != 0 or p[2] != 1:
+            return None
+
+        pts_dts_flags = (p[7] >> 6) & 0x03
+
+        if pts_dts_flags == 3:
+            # Both PTS and DTS present — extract DTS (bytes 14-18)
+            if len(p) < 19:
+                return None
+            dts = ((p[14] >> 1) & 0x07) << 30
+            dts |= (p[15] << 22)
+            dts |= ((p[16] >> 1) << 15)
+            dts |= (p[17] << 7)
+            dts |= (p[18] >> 1)
+            return dts
+
+        if pts_dts_flags == 2:
+            # PTS only — use as DTS
+            pts = ((p[9] >> 1) & 0x07) << 30
+            pts |= (p[10] << 22)
+            pts |= ((p[11] >> 1) << 15)
+            pts |= (p[12] << 7)
+            pts |= (p[13] >> 1)
+            return pts
+
+        return None
+
 class StreamBuffer:
     """Manages stream data buffering with optimized chunk storage"""
 
@@ -44,6 +223,9 @@ class StreamBuffer:
 
         self._write_buffer = bytearray()
         self.target_chunk_size = ConfigHelper.get('BUFFER_CHUNK_SIZE', TS_PACKET_SIZE * 5644)  # ~1MB default
+
+        # DTS deduplication — strips duplicate packets from FFmpeg -copyts reconnects
+        self._dedup = TSDeduplicator(channel_id=channel_id)
 
         # Sorted-set key for chunk receive-timestamps (time-based positioning)
         self.chunk_timestamps_key = RedisKeys.chunk_timestamps(channel_id) if channel_id else ""
@@ -94,7 +276,10 @@ class StreamBuffer:
                 complete_packets = combined_data[:complete_packets_size]
                 self._partial_packet = combined_data[complete_packets_size:]
 
-                # Add completed packets to write buffer
+                # Filter out DTS+1 duplicate packets (from FFmpeg -copyts reconnects)
+                complete_packets = self._dedup.filter_packets(complete_packets)
+
+                # Add filtered packets to write buffer
                 self._write_buffer.extend(complete_packets)
 
                 # Only write to Redis when we have enough data for an optimized chunk
